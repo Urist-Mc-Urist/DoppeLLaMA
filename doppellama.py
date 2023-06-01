@@ -1,7 +1,9 @@
-import discord, os, torch, json, sentencepiece
+import discord, os, torch, json, transformers, datasets
 from discord import app_commands
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, BitsAndBytesConfig
+from datasets import Dataset, load_dataset
+
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 
 #load API key and set intents
@@ -27,7 +29,7 @@ nf4_config = BitsAndBytesConfig(
 print("Loading model...")
 model_id = "decapoda-research/llama-7b-hf"
 
-model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config)
+model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config, device_map={"":0})
 tokenizer = LlamaTokenizer.from_pretrained(model_id)
 print(model)
 print(tokenizer)
@@ -43,6 +45,7 @@ async def ping(interaction: discord.Interaction):
     print("Test command received")
     await interaction.response.send_message('Hello World')
 
+"""
 @tree.command(name="load", description="This command loads a LLM model into the bot")
 async def load(interaction: discord.Interaction):
     global model
@@ -57,6 +60,7 @@ async def load(interaction: discord.Interaction):
     print(model)
     print(tokenizer)
     await interaction.followup.send("Model loaded")
+"""
 
 @tree.command(name="basic_prompt", description="Query the LLM with a prompt")
 async def basic_prompt(interaction: discord.Interaction, prompt: str):
@@ -71,12 +75,21 @@ async def basic_prompt(interaction: discord.Interaction, prompt: str):
 
     device = "cuda:0"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    outputs = model.generate(**inputs, max_new_tokens=150, temperature=1.1)
+    outputs = model.generate(
+        **inputs, 
+        max_new_tokens=150, 
+        temperature=0.72,
+        top_p=0.73,
+        top_k=0,
+        repetition_penalty=1.2
+        )
+
     result = tokenizer.decode(outputs[0], skip_special_tokens=True)
     print(result)
 
-    response = interaction.user.display_name + ": " + prompt + "\n" + "Output: " + result
+    response = interaction.user.display_name + ": " + prompt + "\n\n" + "Output: " + result
     await interaction.followup.send(response)
+
 
 @tree.command(name="scrape", description="scrapes messages from server")
 async def dataset(interaction: discord.Interaction, limit: int):
@@ -90,7 +103,7 @@ async def dataset(interaction: discord.Interaction, limit: int):
             async for message in channel.history(limit=limit):  # Get the message history for the channel
                 if(message.content and not message.content.startswith('http') and not message.content.startswith('https')):
                     print(f"Got: {str(message.author)}: {message.content}")
-                    messages.append({"user": str(message.author), "content": message.content})
+                    messages.append({"message": str(message.author) + message.content})
         except Exception as e:
             print(f"Could not fetch history for channel {channel.name}, possibly missing permissions.")
     
@@ -112,8 +125,23 @@ async def train(interaction: discord.Interaction):
     #TODO: Utilizing QLoRA, train the LLM
 
     global model
+    global tokenizer
     if(model is None):
         print("No model loaded")
+        return
+    
+    await interaction.response.send_message('Beginning training...')
+    guild = interaction.guild
+
+    filename = f"./messages/{guild.id}/messages.json"
+    if os.path.exists(filename):
+        with open(filename, "r") as file:
+            data = load_dataset("json", data_files=filename)
+            print(data["train"])
+            data = data.map(lambda samples: tokenizer(samples["message"]), batched=True)
+            print("Training data loaded")
+    else:
+        interaction.followup.send_message("Error: No training data. '/scrape' server first")
         return
     
     model.gradient_checkpointing_enable()
@@ -122,14 +150,36 @@ async def train(interaction: discord.Interaction):
     config = LoraConfig(
         r=8, 
         lora_alpha=32, 
-        target_modules=["query_key_value"], 
         lora_dropout=0.05, 
         bias="none", 
         task_type="CAUSAL_LM"
     )
 
-    peftModel = get_peft_model(model, config)
-    print_trainable_parameters(peftModel)
+    model = get_peft_model(model, config)
+    print_trainable_parameters(model)
+    
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    trainer = transformers.Trainer(
+        model=model,
+        train_dataset=data["train"],
+        args=transformers.TrainingArguments(
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=4,
+            warmup_steps=2,
+            max_steps=10,
+            learning_rate=2e-4,
+            fp16=True,
+            logging_steps=1,
+            save_steps=10,
+            output_dir="outputs",
+            optim="paged_adamw_8bit"
+        ),
+        data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    )  
+    model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+    trainer.train()
+    interaction.followup.send("Training complete")
+
     
 
 
