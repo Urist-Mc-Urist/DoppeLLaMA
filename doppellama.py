@@ -32,14 +32,35 @@ async def ping(interaction: discord.Interaction):
 
 @tree.command(name="load", description="This command loads a LLM model into the bot")
 async def load(interaction: discord.Interaction):
-    #TODO: specify the model download location (fastest drive)
+    global model
+    global tokenizer
+
     print("Loading model...")
+    await interaction.response.send_message('Loading model...')
     model_id = "facebook/opt-350m"
 
     model = AutoModelForCausalLM.from_pretrained(model_id, load_in_4bit=True, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     print(model)
-    await interaction.response.send_message('Model loaded')
+    print(tokenizer)
+    await interaction.followup.send("Model loaded")
+
+@tree.command(name="basic_prompt", description="Query the LLM with a prompt")
+async def basic_prompt(interaction: discord.Interaction, prompt: str):
+    await interaction.response.send_message('Generating response...')
+
+    global model
+    global tokenizer
+
+    device = "cuda:0"
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    outputs = model.generate(**inputs, max_new_tokens=20)
+    result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print(result)
+
+    response = interaction.user.display_name + ": " + prompt + "\n" + "Output: " + result
+    await interaction.followup.send(response)
+
 
 @tree.command(name="unload", description="This command unloads the LLM from memory")
 async def unload(interaction: discord.Interaction):
