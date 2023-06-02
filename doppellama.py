@@ -1,8 +1,9 @@
-import discord, os, torch, json, transformers, datasets
+import discord, os, torch, json, transformers, datasets, asyncio
 from discord import app_commands
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, BitsAndBytesConfig
 from datasets import Dataset, load_dataset
+from concurrent.futures import ThreadPoolExecutor
 
 from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 
@@ -23,13 +24,13 @@ tokenizer = None
 nf4_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
+    bnb_4bit_quant_type="nf4"
 )
 print("Loading model...")
 model_id = "decapoda-research/llama-7b-hf"
 
-model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config, device_map={"":0})
+#model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config, device_map={"":0})
+model = AutoModelForCausalLM.from_pretrained("./models/1099579232839024710", quantization_config=nf4_config, device_map={"":0})
 tokenizer = LlamaTokenizer.from_pretrained(model_id)
 print(model)
 print(tokenizer)
@@ -40,27 +41,38 @@ async def on_ready():
     await tree.sync()
     print(f"Bot is ready. Connected to {len(bot.guilds)} guild(s).")
 
+
 @tree.command(name="test", description="Test command")
 async def ping(interaction: discord.Interaction):
     print("Test command received")
     await interaction.response.send_message('Hello World')
 
-"""
-@tree.command(name="load", description="This command loads a LLM model into the bot")
+
+@tree.command(name="load", description="Load this server's trained model into the bot")
 async def load(interaction: discord.Interaction):
     global model
     global tokenizer
+    global nf4_config
+    print(nf4_config)
 
-    print("Loading model...")
-    await interaction.response.send_message('Loading model...')
-    model_id = "kuleshov/llama-7b-4bit"
+    print("Attempting to load model...")
+    await interaction.response.send_message("Attempting to load model...")
+    
+    with ThreadPoolExecutor() as executor:
+        loop = asyncio.get_event_loop()
+        model_path = f"./models/{interaction.guild_id}"
+        if(model_path):
+            model = None
+            await interaction.followup.send("Found model")
+            model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=nf4_config, device_map={"":0})
+            #model = await loop.run_in_executor(executor, load_model, model_path, nf4_config, {"": 0})
+            await interaction.followup.send("Model successfully loaded")
+        else:
+            await interaction.followup.send("No model found for current guild")
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    print(model)
-    print(tokenizer)
-    await interaction.followup.send("Model loaded")
-"""
+def load_model(model_path, quantization_config, device_map):
+    return AutoModelForCausalLM.from_pretrained(model_path, quantization_config=quantization_config, device_map=device_map)
+
 
 @tree.command(name="basic_prompt", description="Query the LLM with a prompt")
 async def basic_prompt(interaction: discord.Interaction, prompt: str):
@@ -113,17 +125,15 @@ async def dataset(interaction: discord.Interaction, limit: int):
 
     await interaction.followup.send('Scrape complete')
 
+
 @tree.command(name="unload", description="This command unloads the LLM from memory")
 async def unload(interaction: discord.Interaction):
     pass
     #TODO: unload the LLM
 
-@tree.command(name="train", description="Train an LLM model on the message content of the server")
-async def train(interaction: discord.Interaction):
-    #TODO: Scrape the server for messages
-    #TODO: Format the messages into a training set
-    #TODO: Utilizing QLoRA, train the LLM
 
+@tree.command(name="train", description="Train an LLM model on the message content of the server")
+async def train(interaction: discord.Interaction, training_steps: int):
     global model
     global tokenizer
     if(model is None):
@@ -157,31 +167,43 @@ async def train(interaction: discord.Interaction):
 
     model = get_peft_model(model, config)
     print_trainable_parameters(model)
+
+    with ThreadPoolExecutor() as executor:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, train_model, model, tokenizer, data, guild.id, training_steps)
     
+    await interaction.followup.send("Training complete")
+
+
+def train_model(model, tokenizer, data_set, guild_id, training_steps):
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
+    training_args = transformers.TrainingArguments(
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        warmup_steps=2,
+        max_steps=training_steps,
+        learning_rate=2e-4,
+        fp16=True,
+        logging_steps=1,
+        output_dir=f"./models/{guild_id}",
+        optim="paged_adamw_8bit"
+    )
+
     trainer = transformers.Trainer(
         model=model,
-        train_dataset=data["train"],
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=4,
-            warmup_steps=2,
-            max_steps=10,
-            learning_rate=2e-4,
-            fp16=True,
-            logging_steps=1,
-            save_steps=10,
-            output_dir="outputs",
-            optim="paged_adamw_8bit"
-        ),
+        train_dataset=data_set["train"],
+        args=training_args,
         data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
-    )  
-    model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+    )
     trainer.train()
-    interaction.followup.send("Training complete")
+    print("Saving model")
+    trainer.save_model(output_dir=f"./models/{guild_id}")
 
-    
-
+    # Save the model configuration
+    print("Saving model configuration")
+    config = model.config
+    config.save_pretrained(f"./models/{guild_id}")
 
 def print_trainable_parameters(model):
     """
