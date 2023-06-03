@@ -4,8 +4,7 @@ from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, BitsAndBytesConfig
 from datasets import Dataset, load_dataset
 from concurrent.futures import ThreadPoolExecutor
-
-from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, PeftConfig, prepare_model_for_kbit_training, get_peft_model
 
 #load API key and set intents
 load_dotenv()
@@ -21,16 +20,18 @@ tree = app_commands.CommandTree(bot)
 #declare model and tokenizer
 model = None
 tokenizer = None
+lora_loaded = False
 nf4_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4"
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16
 )
 print("Loading model...")
 model_id = "decapoda-research/llama-7b-hf"
 
-#model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config, device_map={"":0})
-model = AutoModelForCausalLM.from_pretrained("./models/1099579232839024710", quantization_config=nf4_config, device_map={"":0})
+model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config, device_map={"":0})
+
 tokenizer = LlamaTokenizer.from_pretrained(model_id)
 print(model)
 print(tokenizer)
@@ -45,66 +46,73 @@ async def on_ready():
 @tree.command(name="test", description="Test command")
 async def ping(interaction: discord.Interaction):
     print("Test command received")
-    await interaction.response.send_message('Hello World')
+    await interaction.response.send_message(interaction.user)
 
 
 @tree.command(name="load", description="Load this server's trained model into the bot")
 async def load(interaction: discord.Interaction):
     global model
     global tokenizer
-    global nf4_config
-    print(nf4_config)
+    global lora_loaded
+    base_model = model
 
     print("Attempting to load model...")
     await interaction.response.send_message("Attempting to load model...")
     
     with ThreadPoolExecutor() as executor:
         loop = asyncio.get_event_loop()
-        model_path = f"./models/{interaction.guild_id}"
-        if(model_path):
-            model = None
+        lora_path = f"./models/{interaction.guild_id}"
+        if(lora_path):
             await interaction.followup.send("Found model")
-            model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=nf4_config, device_map={"":0})
-            #model = await loop.run_in_executor(executor, load_model, model_path, nf4_config, {"": 0})
+            model = await loop.run_in_executor(executor, load_model, lora_path, base_model)
+            model.eval()
+            lora_loaded = True
             await interaction.followup.send("Model successfully loaded")
         else:
             await interaction.followup.send("No model found for current guild")
 
-def load_model(model_path, quantization_config, device_map):
-    return AutoModelForCausalLM.from_pretrained(model_path, quantization_config=quantization_config, device_map=device_map)
+def load_model(lora_path, base_model):
+    peft_model_id = lora_path
+    model = PeftModel.from_pretrained(base_model, peft_model_id)
+    return model
 
 
-@tree.command(name="basic_prompt", description="Query the LLM with a prompt")
-async def basic_prompt(interaction: discord.Interaction, prompt: str):
+@tree.command(name="impersonate", description="Impersonate a user. user: 'user#0434', tokens <= 400")
+async def basic_prompt(interaction: discord.Interaction, prompt: str, user: str, tokens: int):
     global model
     global tokenizer
 
-    if(model is None):
-        await interaction.response.send_message("No model loaded")
+    if(tokens > 400):
+        await interaction.response.send_message('Too many tokens. (Must be <= 400)')
         return
 
     await interaction.response.send_message('Generating response...')
 
     device = "cuda:0"
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    outputs = model.generate(
-        **inputs, 
-        max_new_tokens=150, 
-        temperature=0.72,
-        top_p=0.73,
-        top_k=0,
-        repetition_penalty=1.2
-        )
+    system_prompt = str(interaction.user) + ": " + prompt + "\n\n" + user + ": "
+    inputs = tokenizer(system_prompt, return_tensors="pt").to(device)
+
+    def generate_wrapper(model, tokens):
+        return model.generate(
+            **inputs, 
+            max_new_tokens=tokens, 
+            temperature=0.72,
+            top_p=0.73,
+            top_k=0,
+            repetition_penalty=1.2
+            )
+
+    with ThreadPoolExecutor() as executor:
+        loop = asyncio.get_event_loop()
+        outputs = await loop.run_in_executor(executor, generate_wrapper, model, tokens)
 
     result = tokenizer.decode(outputs[0], skip_special_tokens=True)
     print(result)
-
-    response = interaction.user.display_name + ": " + prompt + "\n\n" + "Output: " + result
-    await interaction.followup.send(response)
+    await interaction.followup.send(result)
 
 
 @tree.command(name="scrape", description="scrapes messages from server")
-async def dataset(interaction: discord.Interaction, limit: int):
+async def scrape(interaction: discord.Interaction, limit: int):
     await interaction.response.send_message('Beginning scrape...')
     guild = interaction.guild
     print(f"Scanning {guild.name}")
@@ -115,7 +123,7 @@ async def dataset(interaction: discord.Interaction, limit: int):
             async for message in channel.history(limit=limit):  # Get the message history for the channel
                 if(message.content and not message.content.startswith('http') and not message.content.startswith('https')):
                     print(f"Got: {str(message.author)}: {message.content}")
-                    messages.append({"message": str(message.author) + message.content})
+                    messages.append({"message": str(message.author) + ": " + message.content})
         except Exception as e:
             print(f"Could not fetch history for channel {channel.name}, possibly missing permissions.")
     
@@ -126,21 +134,18 @@ async def dataset(interaction: discord.Interaction, limit: int):
     await interaction.followup.send('Scrape complete')
 
 
-@tree.command(name="unload", description="This command unloads the LLM from memory")
-async def unload(interaction: discord.Interaction):
-    pass
-    #TODO: unload the LLM
-
-
 @tree.command(name="train", description="Train an LLM model on the message content of the server")
 async def train(interaction: discord.Interaction, training_steps: int):
     global model
     global tokenizer
-    if(model is None):
-        print("No model loaded")
+    global lora_loaded
+
+    if(lora_loaded):
+        await interaction.response.send_message('A model has already been loaded for inference\n\n If you want to train a model on this server, reset the bot call "/train" without calling "/load"')
         return
     
     await interaction.response.send_message('Beginning training...')
+
     guild = interaction.guild
 
     filename = f"./messages/{guild.id}/messages.json"
@@ -151,7 +156,7 @@ async def train(interaction: discord.Interaction, training_steps: int):
             data = data.map(lambda samples: tokenizer(samples["message"]), batched=True)
             print("Training data loaded")
     else:
-        interaction.followup.send_message("Error: No training data. '/scrape' server first")
+        interaction.followup.send("Error: No training data. '/scrape' server first")
         return
     
     model.gradient_checkpointing_enable()
@@ -176,6 +181,7 @@ async def train(interaction: discord.Interaction, training_steps: int):
 
 
 def train_model(model, tokenizer, data_set, guild_id, training_steps):
+
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
     training_args = transformers.TrainingArguments(
@@ -197,13 +203,7 @@ def train_model(model, tokenizer, data_set, guild_id, training_steps):
         data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
     )
     trainer.train()
-    print("Saving model")
-    trainer.save_model(output_dir=f"./models/{guild_id}")
-
-    # Save the model configuration
-    print("Saving model configuration")
-    config = model.config
-    config.save_pretrained(f"./models/{guild_id}")
+    model.save_pretrained(f"./models/{guild_id}")
 
 def print_trainable_parameters(model):
     """
