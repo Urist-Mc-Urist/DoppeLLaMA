@@ -2,7 +2,7 @@ import discord, os, torch, json, transformers, asyncio, random
 from discord import app_commands
 from dotenv import load_dotenv
 from transformers import AutoModelForCausalLM,  LlamaTokenizer, BitsAndBytesConfig
-from datasets import load_dataset
+from datasets import Dataset
 from concurrent.futures import ThreadPoolExecutor
 from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training, get_peft_model
 
@@ -32,8 +32,9 @@ print("Loading model...")
 model_id = "decapoda-research/llama-7b-hf"
 
 model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=nf4_config, device_map={"":0})
-
 tokenizer = LlamaTokenizer.from_pretrained(model_id)
+tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+model.resize_token_embeddings(len(tokenizer))
 print("Base model loaded")
 
 #=============== Bot Events and Commands =================
@@ -57,19 +58,21 @@ async def load(interaction: discord.Interaction):
 
 
     print("Attempting to load model...")
-    await interaction.response.send_message("Attempting to load model...")
+    await interaction.response.send_message(content="Attempting to load model...", delete_after=15)
+    
     
     #create new thread to load model, loading the LoRAs is quick so probably not needed, but good practice
     with ThreadPoolExecutor() as executor:
         lora_path = f"./models/{interaction.guild_id}"
-        if(lora_path):
-            await interaction.followup.send("Found model")
+        lora_exists = os.path.exists(f"./models/{interaction.guild_id}/adapter_model.bin")
+        if(lora_exists):
+            await interaction.edit_original_response(content="Model found")
             loop = asyncio.get_event_loop()
             model = await loop.run_in_executor(executor, load_model, lora_path, base_model)
             lora_loaded = True
-            await interaction.followup.send("Model successfully loaded")
+            await interaction.edit_original_response(content="Model successfully loaded")
         else:
-            await interaction.followup.send("No model found for current guild")
+            await interaction.edit_original_response(content="No model found for current guild")
 
 def load_model(lora_path, base_model):
     peft_model_id = lora_path
@@ -84,26 +87,88 @@ async def basic_prompt(interaction: discord.Interaction, prompt: str, user: str,
     global currently_training
 
     if currently_training:
-        await interaction.response.send_message("Error: Currently training")
+        await interaction.response.send_message(content="Error: Currently training", delete_after=15)
         return
 
     if tokens > 400 :
-        await interaction.response.send_message('Too many tokens. (Must be <= 400)')
+        await interaction.response.send_message('Too many tokens. (Must be <= 400)', delete_after=15)
         return
 
     await interaction.response.send_message('Generating response...')
 
-    system_message = "Below is an interaction between two users in a chatroom::\n\n"
-    example1 = "SlimShady#4875: What should I make for dinner? I'm thinking about making some fried chicken\n\nBigMike#0232: You could always order a pizza or something\n\n"
-    example2 = "ExampleMan#3424: I'm going to hop on for some games, anyone want to join?\n\nZoomerBoomer#5995: Yeah I'm down, what did you want to play?\n\n"
+    #example1 = "SlimShady#4875: What should I make for dinner? I'm thinking about making some fried chicken\n\nBigMike#0232: You could always order a pizza or something\n\n"
+    #example2 = "ExampleMan#3424: I'm going to hop on for some games, anyone want to join?\n\nZoomerBoomer#5995: Yeah I'm down, what did you want to play?\n\n"
     #example3 = "TechGuru#1234: Hey everyone, I'm facing a frustrating issue with my computer. It's been freezing constantly, and I'm not sure what's causing it. I've tried running a virus scan and clearing up some disk space, but nothing seems to be working. Any suggestions or troubleshooting tips would be greatly appreciated!\n\nCodeMaster#9876: Hey TechGuru#1234, sorry to hear about your computer troubles. Freezing issues can be caused by various factors. Have you checked the CPU temperature? Overheating can lead to system freezes. You can use monitoring software to keep an eye on the temperature. Additionally, updating your drivers and checking for any hardware conflicts might also help. Let's troubleshoot this together!"
     #example4 = "BookLover#2341: I've been on a quest for an enthralling fantasy novel that will transport me to magical realms and captivate my imagination. Any recommendations? I crave epic adventures filled with heroic characters and intricate plots.\n\nStoryteller#9987: Absolutely! I highly recommend diving into 'The Name of the Wind' by Patrick Rothfuss. It's a spellbinding tale of a legendary hero's journey, brimming with breathtaking world-building and unforgettable moments. Prepare to lose yourself in its pages!"
     #example5 = "UserA#1231: What are you guys doing?\n\nUserb#0232: Just haning out, what about you?\n\n"
-    system_prompt = system_message + example1 + system_message + example2 + system_message #+ example3 + system_message + example4 + system_message + example5 + system_message
-    model_input = system_prompt + str(interaction.user) + ": " + prompt + "\n\n" + user + ":"
-    inputs = tokenizer(model_input, return_tensors="pt").to('cuda')
+    system_prompt = "### Human: This is a conversation between two users. Write only the next user's response:\n\n" + str(interaction.user) + ": " + prompt + "\n\n" + "### Assistant: \n\n" + user + ": " + "\n\n"
+    inputs = tokenizer(system_prompt, return_tensors="pt").to('cuda')
 
-    def generate_wrapper(model, tokens):
+    with ThreadPoolExecutor() as executor:
+        loop = asyncio.get_event_loop()
+        outputs = await loop.run_in_executor(executor, generate_wrapper, model, 50, inputs)
+
+    result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print(result)
+
+    #remove additional system prompt from response
+    generated_text = result[len(system_prompt):]
+
+    index = generated_text.find("### Human")
+    if index != -1:  # substring found
+        generated_text = generated_text[:index]  # remove everything after the substring
+
+    response = str(interaction.user) + ": " + prompt + "\n\n" + user + ":" + generated_text
+    await interaction.edit_original_response(content=response)
+
+
+@tree.command(name="opine", description="Generate a response based on most recent chat history")
+async def opine(interaction: discord.Interaction, user: str):
+    global model
+    global tokenizer
+    global currently_training
+
+    if currently_training:
+        await interaction.response.send_message(content="Error: Currently training", delete_after=15)
+        return
+    
+
+    messages = []
+    async for message in interaction.channel.history(limit=10):  # Get the message history for the channel
+        #remove empty messages and links
+        if(message.content):
+            print(f"Got: {str(message.author)}: {message.content}")
+            messages.insert(0, (str(message.author) + ": " + message.content))
+
+    await interaction.response.send_message('Generating response...')
+
+    system_prompt = ""
+    for message in messages:
+        system_prompt += message + "\n\n"
+    
+    system_prompt +=  user + ":" + "\n\n"
+
+    inputs = tokenizer(system_prompt, return_tensors="pt").to('cuda')
+
+    with ThreadPoolExecutor() as executor:
+        loop = asyncio.get_event_loop()
+        outputs = await loop.run_in_executor(executor, generate_wrapper, model, 50, inputs)
+
+    result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print(result)
+
+    #remove additional system prompt from response
+    generated_text = result[len(system_prompt):]
+
+    index = generated_text.find("### Human")
+    if index != -1:  # substring found
+        generated_text = generated_text[:index]  # remove everything after the substring
+
+    response = user + ":" + generated_text
+    await interaction.edit_original_response(content=response)
+
+
+def generate_wrapper(model, tokens, inputs):
         seed = random.randint(0, 10000)
         torch.manual_seed(seed)
 
@@ -111,24 +176,12 @@ async def basic_prompt(interaction: discord.Interaction, prompt: str, user: str,
             return model.generate(
                 **inputs, 
                 max_new_tokens=tokens, 
-                temperature=0.9,
+                temperature=1,
                 top_p=0.72,
-                top_k=0,
-                repetition_penalty=1.1
+                top_k=40,
+                repetition_penalty=1.1,
+                early_stopping=True,
                 )
-
-    with ThreadPoolExecutor() as executor:
-        loop = asyncio.get_event_loop()
-        outputs = await loop.run_in_executor(executor, generate_wrapper, model, tokens)
-
-    result = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    print(result)
-
-    #remove additional system prompt from response
-    discard = len(model_input)
-    generated_text = result[discard:].splitlines()[0]
-    response = str(interaction.user) + ": " + prompt + "\n\n" + user + ":" + generated_text
-    await interaction.followup.send(response)
 
 
 @tree.command(name="scrape", description="scrapes messages from server")
@@ -198,12 +251,22 @@ async def train(interaction: discord.Interaction, training_steps: int):
     #Load training data (messages)
     filename = f"./messages/{guild.id}/messages.json"
     if os.path.exists(filename):
-        with open(filename, "r") as file:
-            #convert json file into transformers dataset and tokenize messages
-            data = load_dataset("json", data_files=filename)
-            print(data["train"])
-            data = data.map(lambda samples: tokenizer(samples["message"]), batched=True)
-            print("Training data loaded")
+        json_data = json.load(open(filename, "r"))
+        messages = [item['message'] for item in json_data]
+        data_dict = {"text": messages}
+        dataset = Dataset.from_dict(data_dict)
+        print(dataset)
+
+        tokenized_dataset = dataset.map(lambda samples: tokenizer(samples["text"]))
+
+        tokenized_dataset = tokenized_dataset.train_test_split(test_size=0.2)
+        dataset_train = tokenized_dataset["train"]
+        dataset_eval = tokenized_dataset["test"]
+
+        print(dataset_train)
+        print(dataset_eval)
+
+        print("Training and evaluation data loaded")
     else:
         interaction.followup.send("Error: No training data. '/scrape' server first")
         return
@@ -226,20 +289,17 @@ async def train(interaction: discord.Interaction, training_steps: int):
     #Create new thread to run training on
     with ThreadPoolExecutor() as executor:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(executor, train_model, model, tokenizer, data, guild.id, training_steps)
+        await loop.run_in_executor(executor, train_model, model, tokenizer, dataset_train, dataset_eval, guild.id, training_steps)
     
     currently_training = False
 
 
-def train_model(model, tokenizer, data_set, guild_id, training_steps):
+def train_model(model, tokenizer, training_data, test_data, guild_id, training_steps):
 
-    #LLaMA tokenizer needs this for some reason
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
-    #specify the training args
-    #Still not sure what the optimal steps per messages is. 1 step per message seems to work
     training_args = transformers.TrainingArguments(
-        per_device_train_batch_size=1,
+        #Any higher of a batch size would crash my RTX 3060
+        per_device_train_batch_size=6,
+        per_device_eval_batch_size=4,
         gradient_accumulation_steps=4,
         warmup_steps=10,
         max_steps=training_steps,
@@ -247,15 +307,22 @@ def train_model(model, tokenizer, data_set, guild_id, training_steps):
         fp16=True,
         logging_steps=1,
         output_dir=f"./models/{guild_id}",
-        optim="paged_adamw_8bit"
+        optim="paged_adamw_8bit",
+        load_best_model_at_end=True,
+        metric_for_best_model="loss",
+        greater_is_better=False,
+        evaluation_strategy="steps",
+        eval_steps=5,
     )
 
     trainer = transformers.Trainer(
         model=model,
-        train_dataset=data_set["train"],
         args=training_args,
+        train_dataset=training_data,
+        eval_dataset=test_data,
         data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
     )
+
     trainer.train()
     model.save_pretrained(f"./models/{guild_id}")
 
