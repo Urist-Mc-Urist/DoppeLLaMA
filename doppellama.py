@@ -1,7 +1,8 @@
 import discord, os, torch, json, transformers, asyncio, random
 from discord import app_commands
 from dotenv import load_dotenv
-from transformers import AutoModelForCausalLM,  LlamaTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, LlamaTokenizer, BitsAndBytesConfig
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from datasets import Dataset
 from concurrent.futures import ThreadPoolExecutor
 from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training, get_peft_model
@@ -56,19 +57,44 @@ async def load(interaction: discord.Interaction):
         await interaction.response.send_message("Error: Currently training")
         return
 
-
     print("Attempting to load model...")
     await interaction.response.send_message(content="Attempting to load model...", delete_after=15)
-    
-    
-    #create new thread to load model, loading the LoRAs is quick so probably not needed, but good practice
+
+    # Create new thread to load model, loading the LoRAs is quick so probably not needed, but good practice
     with ThreadPoolExecutor() as executor:
         lora_path = f"./models/{interaction.guild_id}"
-        lora_exists = os.path.exists(f"./models/{interaction.guild_id}/adapter_model.bin")
-        if(lora_exists):
-            await interaction.edit_original_response(content="Model found")
+        
+        best_checkpoint_path = None
+        lowest_eval_loss = float('inf')  # start with infinity so that any real loss will be lower
+        
+        # iterate over all checkpoint directories
+        for entry in os.scandir(lora_path):
+            if entry.is_dir() and "checkpoint" in entry.name:
+                checkpoint_path = os.path.join(lora_path, entry.name)
+                print(f"checking {checkpoint_path}")
+                trainer_state_file = os.path.join(checkpoint_path, "trainer_state.json")
+
+                # read trainer_state.json
+                with open(trainer_state_file, 'r') as file:
+                    trainer_state = json.load(file)
+
+                # get eval_loss of last log
+                last_log = trainer_state["log_history"][-1]  # last log
+                if "eval_loss" in last_log:
+                    eval_loss = last_log["eval_loss"]
+
+                    if eval_loss < lowest_eval_loss:
+                        print("Found better model")
+                        lowest_eval_loss = eval_loss
+                        best_checkpoint_path = checkpoint_path
+
+        if best_checkpoint_path:
+            lora_model_path = os.path.join(best_checkpoint_path, "adapter_model")
+            print(f"Loading model from {lora_model_path}")
+            await interaction.edit_original_response(content=f"Loading model from {lora_model_path}")
             loop = asyncio.get_event_loop()
-            model = await loop.run_in_executor(executor, load_model, lora_path, base_model)
+            model = await loop.run_in_executor(executor, load_model, lora_model_path, base_model)
+            model.resize_token_embeddings(len(tokenizer))
             lora_loaded = True
             await interaction.edit_original_response(content="Model successfully loaded")
         else:
@@ -79,51 +105,8 @@ def load_model(lora_path, base_model):
     model = PeftModel.from_pretrained(base_model, peft_model_id)
     return model
 
-
-@tree.command(name="impersonate", description="Impersonate a user. user: 'user#0434', tokens <= 400")
-async def basic_prompt(interaction: discord.Interaction, prompt: str, user: str, tokens: int):
-    global model
-    global tokenizer
-    global currently_training
-
-    if currently_training:
-        await interaction.response.send_message(content="Error: Currently training", delete_after=15)
-        return
-
-    if tokens > 400 :
-        await interaction.response.send_message('Too many tokens. (Must be <= 400)', delete_after=15)
-        return
-
-    await interaction.response.send_message('Generating response...')
-
-    #example1 = "SlimShady#4875: What should I make for dinner? I'm thinking about making some fried chicken\n\nBigMike#0232: You could always order a pizza or something\n\n"
-    #example2 = "ExampleMan#3424: I'm going to hop on for some games, anyone want to join?\n\nZoomerBoomer#5995: Yeah I'm down, what did you want to play?\n\n"
-    #example3 = "TechGuru#1234: Hey everyone, I'm facing a frustrating issue with my computer. It's been freezing constantly, and I'm not sure what's causing it. I've tried running a virus scan and clearing up some disk space, but nothing seems to be working. Any suggestions or troubleshooting tips would be greatly appreciated!\n\nCodeMaster#9876: Hey TechGuru#1234, sorry to hear about your computer troubles. Freezing issues can be caused by various factors. Have you checked the CPU temperature? Overheating can lead to system freezes. You can use monitoring software to keep an eye on the temperature. Additionally, updating your drivers and checking for any hardware conflicts might also help. Let's troubleshoot this together!"
-    #example4 = "BookLover#2341: I've been on a quest for an enthralling fantasy novel that will transport me to magical realms and captivate my imagination. Any recommendations? I crave epic adventures filled with heroic characters and intricate plots.\n\nStoryteller#9987: Absolutely! I highly recommend diving into 'The Name of the Wind' by Patrick Rothfuss. It's a spellbinding tale of a legendary hero's journey, brimming with breathtaking world-building and unforgettable moments. Prepare to lose yourself in its pages!"
-    #example5 = "UserA#1231: What are you guys doing?\n\nUserb#0232: Just haning out, what about you?\n\n"
-    system_prompt = "### Human: This is a conversation between two users. Write only the next user's response:\n\n" + str(interaction.user) + ": " + prompt + "\n\n" + "### Assistant: \n\n" + user + ": " + "\n\n"
-    inputs = tokenizer(system_prompt, return_tensors="pt").to('cuda')
-
-    with ThreadPoolExecutor() as executor:
-        loop = asyncio.get_event_loop()
-        outputs = await loop.run_in_executor(executor, generate_wrapper, model, 50, inputs)
-
-    result = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    print(result)
-
-    #remove additional system prompt from response
-    generated_text = result[len(system_prompt):]
-
-    index = generated_text.find("### Human")
-    if index != -1:  # substring found
-        generated_text = generated_text[:index]  # remove everything after the substring
-
-    response = str(interaction.user) + ": " + prompt + "\n\n" + user + ":" + generated_text
-    await interaction.edit_original_response(content=response)
-
-
 @tree.command(name="opine", description="Generate a response based on most recent chat history")
-async def opine(interaction: discord.Interaction, user: str):
+async def opine(interaction: discord.Interaction, user: str, temp: float, rep_penalty: float):
     global model
     global tokenizer
     global currently_training
@@ -138,7 +121,10 @@ async def opine(interaction: discord.Interaction, user: str):
         #remove empty messages and links
         if(message.content):
             print(f"Got: {str(message.author)}: {message.content}")
-            messages.insert(0, (str(message.author) + ": " + message.content))
+            if "DoppeLLaMA" in str(message.author):
+                messages.insert(0, message.content)
+            else:
+                messages.insert(0, (str(message.author) + ": " + message.content))
 
     await interaction.response.send_message('Generating response...')
 
@@ -146,13 +132,13 @@ async def opine(interaction: discord.Interaction, user: str):
     for message in messages:
         system_prompt += message + "\n\n"
     
-    system_prompt +=  user + ":" + "\n\n"
+    system_prompt +=  user + ":"
 
     inputs = tokenizer(system_prompt, return_tensors="pt").to('cuda')
 
     with ThreadPoolExecutor() as executor:
         loop = asyncio.get_event_loop()
-        outputs = await loop.run_in_executor(executor, generate_wrapper, model, 50, inputs)
+        outputs = await loop.run_in_executor(executor, generate_wrapper, model, inputs)
 
     result = tokenizer.decode(outputs[0], skip_special_tokens=True)
     print(result)
@@ -160,7 +146,7 @@ async def opine(interaction: discord.Interaction, user: str):
     #remove additional system prompt from response
     generated_text = result[len(system_prompt):]
 
-    index = generated_text.find("### Human")
+    index = generated_text.find(": ")
     if index != -1:  # substring found
         generated_text = generated_text[:index]  # remove everything after the substring
 
@@ -168,19 +154,24 @@ async def opine(interaction: discord.Interaction, user: str):
     await interaction.edit_original_response(content=response)
 
 
-def generate_wrapper(model, tokens, inputs):
+def generate_wrapper(model, inputs):
+        global tokenizer
         seed = random.randint(0, 10000)
         torch.manual_seed(seed)
+
+        eos_token = "\n\n"
+        eos_token_id = tokenizer.encode(eos_token)
 
         with torch.no_grad():
             return model.generate(
                 **inputs, 
-                max_new_tokens=tokens, 
-                temperature=1,
+                max_new_tokens=100, 
+                temperature=0.75,
                 top_p=0.72,
                 top_k=40,
-                repetition_penalty=1.1,
+                repetition_penalty=1.05,
                 early_stopping=True,
+                eos_token_id=eos_token_id
                 )
 
 
@@ -298,21 +289,21 @@ def train_model(model, tokenizer, training_data, test_data, guild_id, training_s
 
     training_args = transformers.TrainingArguments(
         #Any higher of a batch size would crash my RTX 3060
-        per_device_train_batch_size=6,
-        per_device_eval_batch_size=4,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
         gradient_accumulation_steps=4,
         warmup_steps=10,
         max_steps=training_steps,
         learning_rate=2e-4,
         fp16=True,
-        logging_steps=1,
+        logging_steps=5,
         output_dir=f"./models/{guild_id}",
         optim="paged_adamw_8bit",
-        load_best_model_at_end=True,
         metric_for_best_model="loss",
         greater_is_better=False,
         evaluation_strategy="steps",
-        eval_steps=5,
+        eval_steps=training_steps/4,
+        save_steps=training_steps/4
     )
 
     trainer = transformers.Trainer(
@@ -321,10 +312,11 @@ def train_model(model, tokenizer, training_data, test_data, guild_id, training_s
         train_dataset=training_data,
         eval_dataset=test_data,
         data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        callbacks=[SavePeftModelCallback]
     )
 
     trainer.train()
-    model.save_pretrained(f"./models/{guild_id}")
+    model.save_pretrained(f"./models/{guild_id}/checkpoint-{training_steps}")
 
 def print_trainable_parameters(model):
     """
@@ -339,5 +331,26 @@ def print_trainable_parameters(model):
     print(
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
     )
+
+
+class SavePeftModelCallback(transformers.TrainerCallback):
+    def on_save(
+        self,
+        args: transformers.TrainingArguments,
+        state: transformers.TrainerState,
+        control: transformers.TrainerControl,
+        **kwargs,
+    ):
+        checkpoint_folder = os.path.join(
+            args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
+        )       
+
+        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+        kwargs["model"].save_pretrained(peft_model_path)
+
+        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+        if os.path.exists(pytorch_model_path):
+            os.remove(pytorch_model_path)
+        return control
 
 bot.run(api_key)
