@@ -105,8 +105,8 @@ def load_model(lora_path, base_model):
     model = PeftModel.from_pretrained(base_model, peft_model_id)
     return model
 
-@tree.command(name="opine", description="Generate a response based on most recent chat history")
-async def opine(interaction: discord.Interaction, user: str, temp: float, rep_penalty: float):
+@tree.command(name="impersonate", description="Generate a response based on most recent chat history")
+async def impersonate(interaction: discord.Interaction, user: str):
     global model
     global tokenizer
     global currently_training
@@ -118,15 +118,17 @@ async def opine(interaction: discord.Interaction, user: str, temp: float, rep_pe
 
     messages = []
     async for message in interaction.channel.history(limit=10):  # Get the message history for the channel
+        content = message.content
+        username = message.author.display_name
         #remove empty messages and links
         if(message.content):
-            print(f"Got: {str(message.author)}: {message.content}")
-            if "DoppeLLaMA" in str(message.author):
+            print(f"Got: {username}: {content}")
+            if "DoppeLLaMA" in username:
                 messages.insert(0, message.content)
             else:
-                messages.insert(0, (str(message.author) + ": " + message.content))
-
-    await interaction.response.send_message('Generating response...')
+                messages.insert(0, (username + ": " + content))
+    
+    await interaction.response.defer()
 
     system_prompt = ""
     for message in messages:
@@ -166,10 +168,10 @@ def generate_wrapper(model, inputs):
             return model.generate(
                 **inputs, 
                 max_new_tokens=100, 
-                temperature=0.75,
+                temperature=0.6,
                 top_p=0.72,
                 top_k=40,
-                repetition_penalty=1.05,
+                repetition_penalty=1.08,
                 early_stopping=True,
                 eos_token_id=eos_token_id
                 )
@@ -182,9 +184,10 @@ async def scrape(interaction: discord.Interaction, limit: int, channel: str):
         await interaction.response.send_message("Error: Currently training")
         return
 
-    await interaction.response.send_message('Beginning scrape...')
+    await interaction.response.defer()
+
     guild = interaction.guild
-    print(f"Scanning {guild.name}")
+    print(f"Scanning {channel} in {guild.name}")
 
     #Find text channel with specified name
     target_channel = None
@@ -195,19 +198,38 @@ async def scrape(interaction: discord.Interaction, limit: int, channel: str):
 
     #check if specified channel actually exists
     if target_channel is None:
-        await interaction.followup.send(f"Text channel '{channel}' not found")
+        await interaction.edit_original_response(content=f"Text channel '{channel}' not found")
         return
 
     messages = []
     try:
+        count = 0
+        message_block = ""
         async for message in target_channel.history(limit=limit):  # Get the message history for the channel
+            display_name = message.author.display_name 
+            content = message.content
+
             #remove empty messages and links
-            if(message.content and not message.content.startswith('http') and not message.content.startswith('https')):
-                print(f"Got: {str(message.author)}: {message.content}")
-                messages.append({"message": str(message.author) + ": " + message.content})
+            if(content is None or content is "" or content.startswith('http') or content.startswith('https')):
+                continue
+
+            print(f"Got: {str(display_name)}: {message.content}")
+            #list is not full
+            if count < 6:
+                message_block = message_block + display_name + ": " + content[:255] + "\n\n"
+                count += 1
+            #list is full
+            else:
+                messages.append({"message": message_block})
+
+                count = 1
+                message_block = display_name + ": " + content[:255] + "\n\n"
 
     except Exception as e:
+        print(e)
         print(f"Could not fetch history for channel {target_channel.name}, possibly missing permissions.")
+        await interaction.edit_original_response(content='Error during scrape, possibly missing permissions?')
+        return
 
     print(f"Found {len(messages)} messages")
     
@@ -216,11 +238,11 @@ async def scrape(interaction: discord.Interaction, limit: int, channel: str):
     with open(f'./messages/{guild.id}/messages.json', 'w') as outfile:
         json.dump(messages, outfile)
 
-    await interaction.followup.send('Scrape complete')
+    await interaction.edit_original_response(content='Scrape complete')
 
 
 @tree.command(name="train", description="Train an LLM model on the message content of the server")
-async def train(interaction: discord.Interaction, training_steps: int):
+async def train(interaction: discord.Interaction):
     global model
     global tokenizer
     global lora_loaded
@@ -250,7 +272,7 @@ async def train(interaction: discord.Interaction, training_steps: int):
 
         tokenized_dataset = dataset.map(lambda samples: tokenizer(samples["text"]))
 
-        tokenized_dataset = tokenized_dataset.train_test_split(test_size=0.2)
+        tokenized_dataset = tokenized_dataset.train_test_split(test_size=0.15)
         dataset_train = tokenized_dataset["train"]
         dataset_eval = tokenized_dataset["test"]
 
@@ -280,20 +302,20 @@ async def train(interaction: discord.Interaction, training_steps: int):
     #Create new thread to run training on
     with ThreadPoolExecutor() as executor:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(executor, train_model, model, tokenizer, dataset_train, dataset_eval, guild.id, training_steps)
+        await loop.run_in_executor(executor, train_model, model, tokenizer, dataset_train, dataset_eval, guild.id)
     
     currently_training = False
 
 
-def train_model(model, tokenizer, training_data, test_data, guild_id, training_steps):
+def train_model(model, tokenizer, training_data, test_data, guild_id):
 
     training_args = transformers.TrainingArguments(
         #Any higher of a batch size would crash my RTX 3060
-        per_device_train_batch_size=2,
+        per_device_train_batch_size=1,
         per_device_eval_batch_size=2,
         gradient_accumulation_steps=4,
         warmup_steps=10,
-        max_steps=training_steps,
+        num_train_epochs=3,
         learning_rate=2e-4,
         fp16=True,
         logging_steps=5,
@@ -302,8 +324,8 @@ def train_model(model, tokenizer, training_data, test_data, guild_id, training_s
         metric_for_best_model="loss",
         greater_is_better=False,
         evaluation_strategy="steps",
-        eval_steps=training_steps/4,
-        save_steps=training_steps/4
+        eval_steps=200,
+        save_steps=200
     )
 
     trainer = transformers.Trainer(
@@ -316,7 +338,8 @@ def train_model(model, tokenizer, training_data, test_data, guild_id, training_s
     )
 
     trainer.train()
-    model.save_pretrained(f"./models/{guild_id}/checkpoint-{training_steps}")
+    trainer.evaluate()
+    model.save_pretrained(f"./models/{guild_id}")
 
 def print_trainable_parameters(model):
     """
@@ -352,5 +375,26 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         if os.path.exists(pytorch_model_path):
             os.remove(pytorch_model_path)
         return control
+    
+    def on_train_end(
+        self,
+        args: transformers.TrainingArguments,
+        state: transformers.TrainerState,
+        control: transformers.TrainerControl,
+        **kwargs,
+    ):
+        checkpoint_folder = os.path.join(
+            args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
+        )       
+
+        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+        kwargs["model"].save_pretrained(peft_model_path)
+
+        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+        if os.path.exists(pytorch_model_path):
+            os.remove(pytorch_model_path)
+        return control
+
+
 
 bot.run(api_key)
