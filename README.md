@@ -9,8 +9,11 @@ Development and testing was done on an Nvidia RTX 3060.
 
 ## Local Install (Linux/Mac)
 
-Create a new discord bot, name it "DoppLLaMA", and copy and paste your bot token into teh `.env-template` file.
+Create a new discord bot, name it "DoppLLaMA", and copy and paste your bot token into the `.env-template` file (See the colab link for instructions on how to set up a new bot). Rename `.env-template` to `.env`
+
 Clone the repo and then run the `setup.sh` and `run.sh` commands
+
+
 Unfortunately, DoppeLLaMA needs libraries that are not compatible with windows. So Currently, Windows isn't supported.
 
 ## Google Colab
