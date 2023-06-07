@@ -45,6 +45,8 @@ async def on_ready():
     print(f"Bot is ready. Connected to {len(bot.guilds)} guild(s).")
 
 
+#This method needs to be overly complicated because we're loading a PEFT model instead of a base CausalLM. 
+#Ideally we'd just be able to just specify the load_best_model_at_end but that's not set up to create a PEFT model
 @tree.command(name="load", description="Load this server's trained model into the bot")
 async def load(interaction: discord.Interaction):
     global model
@@ -166,12 +168,13 @@ def generate_wrapper(model, inputs):
 
         with torch.no_grad():
             return model.generate(
+                #You may need to play around with these values to get better generations, particularly repetition_penalty
                 **inputs, 
                 max_new_tokens=100, 
                 temperature=0.6,
                 top_p=0.72,
                 top_k=40,
-                repetition_penalty=1.08,
+                repetition_penalty=1.15, 
                 early_stopping=True,
                 eos_token_id=eos_token_id
                 )
@@ -210,9 +213,10 @@ async def scrape(interaction: discord.Interaction, limit: int, channel: str):
             content = message.content
 
             #remove empty messages and links
-            if(content is None or content is "" or content.startswith('http') or content.startswith('https')):
+            if(content is None or content == "" or content.startswith('http') or content.startswith('https')):
                 continue
 
+            #Messages are trimmed to 255 chars saved in batches of 6 to capture context and interaction
             print(f"Got: {str(display_name)}: {message.content}")
             #list is not full
             if count < 6:
@@ -231,14 +235,16 @@ async def scrape(interaction: discord.Interaction, limit: int, channel: str):
         await interaction.edit_original_response(content='Error during scrape, possibly missing permissions?')
         return
 
-    print(f"Found {len(messages)} messages")
+    print(f"Collected {len(messages)} message sets")
+    await interaction.edit_original_response(content=f"Collected {len(messages)} message sets")
     
     #Save the message list as a JSON file in ./messages/{guild.id}
     os.makedirs(f'./messages/{guild.id}', exist_ok=True)
     with open(f'./messages/{guild.id}/messages.json', 'w') as outfile:
         json.dump(messages, outfile)
 
-    await interaction.edit_original_response(content='Scrape complete')
+    print(f"Scrape complete\nCollected {len(messages)} message sets")
+    await interaction.edit_original_response(content=f"Scrape complete\nCollected {len(messages)} message sets")
 
 
 @tree.command(name="train", description="Train an LLM model on the message content of the server")
@@ -256,7 +262,7 @@ async def train(interaction: discord.Interaction):
         await interaction.response.send_message('A model has already been loaded for inference\n\n If you want to train a model on this server, reset the bot call "/train" without calling "/load"')
         return
     
-    await interaction.response.send_message('Beginning training...')
+    await interaction.response.send_message('Beginning training...\nDiscord interactions time out after 15 minutes, please check the bot logs for updates.')
     currently_training = True
 
     guild = interaction.guild
@@ -268,7 +274,7 @@ async def train(interaction: discord.Interaction):
         messages = [item['message'] for item in json_data]
         data_dict = {"text": messages}
         dataset = Dataset.from_dict(data_dict)
-        print(dataset)
+        print("Total data:", dataset)
 
         tokenized_dataset = dataset.map(lambda samples: tokenizer(samples["text"]))
 
@@ -276,8 +282,8 @@ async def train(interaction: discord.Interaction):
         dataset_train = tokenized_dataset["train"]
         dataset_eval = tokenized_dataset["test"]
 
-        print(dataset_train)
-        print(dataset_eval)
+        print("Train data:", dataset_train)
+        print("Evaluation data:", dataset_eval)
 
         print("Training and evaluation data loaded")
     else:
@@ -305,6 +311,7 @@ async def train(interaction: discord.Interaction):
         await loop.run_in_executor(executor, train_model, model, tokenizer, dataset_train, dataset_eval, guild.id)
     
     currently_training = False
+    print("=============  Training complete  =============")
 
 
 def train_model(model, tokenizer, training_data, test_data, guild_id):
@@ -324,8 +331,8 @@ def train_model(model, tokenizer, training_data, test_data, guild_id):
         metric_for_best_model="loss",
         greater_is_better=False,
         evaluation_strategy="steps",
-        eval_steps=200,
-        save_steps=200
+        eval_steps=5,
+        save_steps=5 
     )
 
     trainer = transformers.Trainer(
@@ -338,8 +345,11 @@ def train_model(model, tokenizer, training_data, test_data, guild_id):
     )
 
     trainer.train()
+
+    #Run a final evaluation and save trainer_state.json into the final checkpoint folder.
+    #As far as I can tell this can't be done in the callback because you don't have access to `trainer` directly
     trainer.evaluate()
-    model.save_pretrained(f"./models/{guild_id}")
+    trainer.state.save_to_json(f"./models/{guild_id}/checkpoint-{trainer.state.global_step}/trainer_state.json")
 
 def print_trainable_parameters(model):
     """
@@ -371,9 +381,8 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
         kwargs["model"].save_pretrained(peft_model_path)
 
-        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
-        if os.path.exists(pytorch_model_path):
-            os.remove(pytorch_model_path)
+        self.remove_uneeded_files(checkpoint_folder) #remove to keep base model (4 Gb) and other files in each checkpoint
+
         return control
     
     def on_train_end(
@@ -385,15 +394,22 @@ class SavePeftModelCallback(transformers.TrainerCallback):
     ):
         checkpoint_folder = os.path.join(
             args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
-        )       
+        )
 
         peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
         kwargs["model"].save_pretrained(peft_model_path)
 
-        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
-        if os.path.exists(pytorch_model_path):
-            os.remove(pytorch_model_path)
+        self.remove_uneeded_files(checkpoint_folder) #remove to keep base model (4 Gb) and other files in each checkpoint
         return control
+    
+    def remove_uneeded_files(self, checkpoint_folder):
+        uneeded_files = ["pytorch_model.bin", "optimizer.pt", "rng_state.pth", "scheduler.pt", "training_args.bin"]
+
+        for file_name in uneeded_files:
+            to_remove = os.path.join(checkpoint_folder, file_name)
+            if os.path.exists(to_remove):
+                os.remove(to_remove)
+
 
 
 
