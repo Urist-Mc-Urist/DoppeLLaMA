@@ -63,44 +63,46 @@ async def load(interaction: discord.Interaction):
     await interaction.response.send_message(content="Attempting to load model...", delete_after=15)
 
     # Create new thread to load model, loading the LoRAs is quick so probably not needed, but good practice
-    with ThreadPoolExecutor() as executor:
-        lora_path = f"./models/{interaction.guild_id}"
-        
-        best_checkpoint_path = None
-        lowest_eval_loss = float('inf')  # start with infinity so that any real loss will be lower
-        
-        # iterate over all checkpoint directories
-        for entry in os.scandir(lora_path):
-            if entry.is_dir() and "checkpoint" in entry.name:
-                checkpoint_path = os.path.join(lora_path, entry.name)
-                print(f"checking {checkpoint_path}")
-                trainer_state_file = os.path.join(checkpoint_path, "trainer_state.json")
+    lora_path = f"./models/{interaction.guild_id}"
+    
+    best_checkpoint_path = None
+    lowest_eval_loss = float('inf')  # start with infinity so that any real loss will be lower
+    
+    # iterate over all checkpoint directories
+    for entry in os.scandir(lora_path):
+        if entry.is_dir() and "checkpoint" in entry.name:
+            checkpoint_path = os.path.join(lora_path, entry.name)
+            print(f"checking {checkpoint_path}")
+            trainer_state_file = os.path.join(checkpoint_path, "trainer_state.json")
 
-                # read trainer_state.json
-                with open(trainer_state_file, 'r') as file:
-                    trainer_state = json.load(file)
+            # read trainer_state.json
+            with open(trainer_state_file, 'r') as file:
+                trainer_state = json.load(file)
 
-                # get eval_loss of last log
-                last_log = trainer_state["log_history"][-1]  # last log
-                if "eval_loss" in last_log:
-                    eval_loss = last_log["eval_loss"]
+            # get eval_loss of last log
+            last_log = trainer_state["log_history"][-1]  # last log
+            if "eval_loss" in last_log:
+                eval_loss = last_log["eval_loss"]
 
-                    if eval_loss < lowest_eval_loss:
-                        print("Found better model")
-                        lowest_eval_loss = eval_loss
-                        best_checkpoint_path = checkpoint_path
+                if eval_loss < lowest_eval_loss:
+                    print("Found better model")
+                    lowest_eval_loss = eval_loss
+                    best_checkpoint_path = checkpoint_path
 
-        if best_checkpoint_path:
-            lora_model_path = os.path.join(best_checkpoint_path, "adapter_model")
-            print(f"Loading model from {lora_model_path}")
-            await interaction.edit_original_response(content=f"Loading model from {lora_model_path}")
+    if best_checkpoint_path:
+        lora_model_path = os.path.join(best_checkpoint_path, "adapter_model")
+        print(f"Loading model from {lora_model_path}")
+        await interaction.edit_original_response(content=f"Loading model from {lora_model_path}")
+
+        with ThreadPoolExecutor() as executor:
             loop = asyncio.get_event_loop()
             model = await loop.run_in_executor(executor, load_model, lora_model_path, base_model)
-            model.resize_token_embeddings(len(tokenizer))
-            lora_loaded = True
-            await interaction.edit_original_response(content="Model successfully loaded")
-        else:
-            await interaction.edit_original_response(content="No model found for current guild")
+
+        model.resize_token_embeddings(len(tokenizer))
+        lora_loaded = True
+        await interaction.edit_original_response(content="Model successfully loaded")
+    else:
+        await interaction.edit_original_response(content="No model found for current guild")
 
 def load_model(lora_path, base_model):
     peft_model_id = lora_path
@@ -150,10 +152,6 @@ async def impersonate(interaction: discord.Interaction, user: str):
     #remove additional system prompt from response
     generated_text = result[len(system_prompt):]
 
-    index = generated_text.find(": ")
-    if index != -1:  # substring found
-        generated_text = generated_text[:index]  # remove everything after the substring
-
     response = user + ":" + generated_text
     await interaction.edit_original_response(content=response)
 
@@ -170,8 +168,8 @@ def generate_wrapper(model, inputs):
             return model.generate(
                 #You may need to play around with these values to get better generations, particularly repetition_penalty
                 **inputs, 
-                max_new_tokens=100, 
-                temperature=0.6,
+                max_new_tokens=200, 
+                temperature=0.9,
                 top_p=0.72,
                 top_k=40,
                 repetition_penalty=1.15, 
